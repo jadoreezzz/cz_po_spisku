@@ -1,0 +1,7 @@
+# Распаковщики архивов: bsdtar (libarchive-tools) читает rar/7z/tar,
+# unar/p7zip — запасные, бот пробует их автоматически.
+[phases.setup]
+aptPkgs = ["libarchive-tools", "p7zip-full", "unar"]
+
+[start]
+cmd = "python app/tg_bot.py"

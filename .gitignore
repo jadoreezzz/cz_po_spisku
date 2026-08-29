@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+bot.log
+bot.err.log
+# секреты и данные — в репозиторий не попадают
+.cz_bot_token
+.cz_bot_allowed_users
+.env
+pools/
+_out/

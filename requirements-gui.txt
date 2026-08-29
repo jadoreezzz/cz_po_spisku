@@ -1,0 +1,3 @@
+-r requirements.txt
+ttkbootstrap>=1.10
+tkinterdnd2>=0.4
