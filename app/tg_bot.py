@@ -565,15 +565,46 @@ def get_token() -> str:
     token = os.environ.get("CZ_BOT_TOKEN", "").strip()
     if not token and TOKEN_FILE.exists():
         token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+    return token
+
+
+def preflight() -> str:
+    """Понятная диагностика при старте — иначе в логах Railway просто «crashed»."""
+    token = get_token()
     if not token:
-        raise SystemExit(
-            f"Не задан токен бота. Положите его в {TOKEN_FILE} или в CZ_BOT_TOKEN."
+        log.error(
+            "НЕ ЗАДАН ТОКЕН БОТА. На Railway: Variables -> CZ_BOT_TOKEN = токен от BotFather "
+            "(локально — файл %s). Без него бот запуститься не может.", TOKEN_FILE
         )
+        raise SystemExit(1)
+    if ":" not in token or not token.split(":", 1)[0].isdigit():
+        log.error("CZ_BOT_TOKEN не похож на токен BotFather (ожидается вид 123456789:AA...). "
+                  "Проверьте, что не скопировались кавычки или пробелы.")
+        raise SystemExit(1)
+
+    if not allowed_users():
+        log.warning(
+            "НЕ ЗАДАН СПИСОК ПОЛЬЗОВАТЕЛЕЙ (CZ_BOT_ALLOWED_USERS). Бот запустится, но будет "
+            "отказывать всем: напишите ему /whoami и впишите свой ID в переменную."
+        )
+    if os.environ.get("CZ_POOL_ROOT"):
+        log.info("Хранилище пулов: %s (том должен быть примонтирован, иначе пулы пропадут "
+                 "при следующем деплое)", pool_store.ROOT)
+    try:
+        pool_store.ROOT.mkdir(parents=True, exist_ok=True)
+        probe = pool_store.ROOT / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as e:
+        log.error("Каталог для пулов %s недоступен на запись: %s. "
+                  "На Railway добавьте Volume с точкой монтирования /data и CZ_POOL_ROOT=/data/pools.",
+                  pool_store.ROOT, e)
+        raise SystemExit(1)
     return token
 
 
 def main() -> None:
-    app = Application.builder().token(get_token()).build()
+    app = Application.builder().token(preflight()).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("pools", cmd_pools))
