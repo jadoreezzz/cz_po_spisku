@@ -18,7 +18,7 @@ from pathlib import Path
 
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.error import Conflict, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -603,6 +603,23 @@ def preflight() -> str:
     return token
 
 
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Понятная строка в логах вместо простыни трейсбека."""
+    err = ctx.error
+    if isinstance(err, Conflict):
+        log.error(
+            "ЭТОГО ЖЕ БОТА СЛУШАЕТ ДРУГОЙ ПРОЦЕСС. Telegram отдаёт обновления только одному: "
+            "остановите локальный ./run_bot.sh или лишний сервис — иначе ответы будут теряться."
+        )
+        return
+    log.exception("Необработанная ошибка", exc_info=err)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(f"Что-то пошло не так: {err}")
+        except TelegramError:
+            pass
+
+
 def main() -> None:
     app = Application.builder().token(preflight()).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
@@ -613,6 +630,7 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
     log.info("Бот запущен. Хранилище пулов: %s", pool_store.ROOT)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
