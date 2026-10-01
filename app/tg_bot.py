@@ -32,7 +32,8 @@ from folders import get_roots, resolve_folder
 from matcher import parse_any_file
 from message_parser import parse_message
 from pdf_builder import BuildReport, FolderSource, build_from_source, make_output_name
-from pool import ARCHIVE_SUFFIXES, ArchiveError, Pool, collect_from_archive, load_pool
+from pool import (ARCHIVE_SUFFIXES, ArchiveError, Pool, available_tools,
+                  collect_from_archive, load_pool)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -300,6 +301,30 @@ async def active_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE, folder_q
     return None, "", []
 
 
+async def download_doc(update: Update, doc, target: Path) -> bool:
+    """Скачать вложение и убедиться, что оно скачалось целиком.
+
+    Обрезанная загрузка выглядит как «битый архив», поэтому сверяем размер
+    с тем, что обещал Telegram, и пробуем ещё раз.
+    """
+    got = -1
+    for attempt in (1, 2):
+        tg_file = await fetch_file(update, doc)
+        if tg_file is None:
+            return False
+        await tg_file.download_to_drive(str(target))
+        got = target.stat().st_size if target.exists() else 0
+        if not doc.file_size or got == doc.file_size:
+            return True
+        log.warning("докачка %s: ожидалось %s байт, получено %s (попытка %s)",
+                    doc.file_name, doc.file_size, got, attempt)
+    await update.message.reply_text(
+        f"Файл «{doc.file_name}» скачался не полностью: {got} из {doc.file_size} байт. "
+        "Пришлите его ещё раз."
+    )
+    return False
+
+
 async def fetch_file(update: Update, doc):
     """Скачать вложение. У Bot API лимит 20 МБ на скачивание — объясняем, если не влезло."""
     try:
@@ -391,6 +416,32 @@ async def cmd_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await build_and_send(update, pending, pool, pool.name, [])
 
 
+async def cmd_diag(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Состояние машины, на которой крутится бот."""
+    if not is_allowed(update):
+        await deny(update)
+        return
+    import platform
+
+    tools = available_tools()
+    root = pool_store.ROOT
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        storage = f"{root} — запись работает"
+    except OSError as e:
+        storage = f"{root} — ЗАПИСЬ НЕ РАБОТАЕТ: {e}"
+    pools = pool_store.list_pools(update.effective_chat.id)
+    await update.message.reply_text(
+        "Python " + platform.python_version() + "\n"
+        + "распаковщики: " + (", ".join(tools) if tools else "НЕТ НИ ОДНОГО (zip всё равно работает)")
+        + "\nхранилище: " + storage
+        + f"\nпулов в этом чате: {len(pools)}"
+    )
+
+
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await deny(update)
@@ -443,12 +494,10 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     caption = (update.message.caption or "").strip()
 
     if suffix in ARCHIVE_SUFFIXES:
-        tg_file = await fetch_file(update, doc)
-        if tg_file is None:
-            return
         with tempfile.TemporaryDirectory() as td:
             zpath = Path(td) / name
-            await tg_file.download_to_drive(str(zpath))
+            if not await download_doc(update, doc, zpath):
+                return
             try:
                 sources = await asyncio.to_thread(collect_from_archive, zpath, Path(td) / "x")
             except ArchiveError as e:
@@ -480,16 +529,14 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if suffix == ".pdf":
-        tg_file = await fetch_file(update, doc)
-        if tg_file is None:
-            return
         inbox = pool_store.inbox_dir(chat_id)
         target = inbox / name
         n = 1
         while target.exists():
             target = inbox / f"{Path(name).stem}~{n}.pdf"
             n += 1
-        await tg_file.download_to_drive(str(target))
+        if not await download_doc(update, doc, target):
+            return
 
         # Это ранее собранный пул? Тогда просто делаем его активным.
         existing = await asyncio.to_thread(load_pool, target, Path(name).stem)
@@ -524,12 +571,10 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if suffix in (".csv", ".xlsx"):
-        tg_file = await fetch_file(update, doc)
-        if tg_file is None:
-            return
         with tempfile.TemporaryDirectory() as td:
             local = Path(td) / name
-            await tg_file.download_to_drive(str(local))
+            if not await download_doc(update, doc, local):
+                return
             parsed_file = await asyncio.to_thread(parse_any_file, local)
         if parsed_file.warnings:
             await update.message.reply_text("\n".join(parsed_file.warnings))
@@ -628,10 +673,13 @@ def main() -> None:
     app.add_handler(CommandHandler("pool", cmd_pool))
     app.add_handler(CommandHandler("go", cmd_go))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
-    log.info("Бот запущен. Хранилище пулов: %s", pool_store.ROOT)
+    tools = available_tools()
+    log.info("Бот запущен. Хранилище пулов: %s | распаковщики: %s",
+             pool_store.ROOT, ", ".join(tools) if tools else "нет (zip обрабатывается своими силами)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

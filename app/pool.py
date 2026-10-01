@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import unicodedata
@@ -212,6 +213,45 @@ def _collect_pdfs(root: Path) -> list[tuple[str, Path]]:
     return out
 
 
+MAGIC = [
+    (b"PK\x03\x04", "zip"), (b"PK\x05\x06", "zip (пустой)"), (b"PK\x07\x08", "zip"),
+    (b"Rar!\x1a\x07", "rar"), (b"7z\xbc\xaf\x27\x1c", "7z"),
+    (b"\x1f\x8b", "gzip"), (b"BZh", "bzip2"), (b"\xfd7zXZ", "xz"),
+    (b"%PDF", "PDF (это не архив, а сам PDF)"),
+]
+
+
+def sniff(path: Path) -> str:
+    """Что это за файл на самом деле — по первым байтам."""
+    try:
+        head = path.open("rb").read(8)
+    except OSError as e:
+        return f"не читается ({e})"
+    for sig, name in MAGIC:
+        if head.startswith(sig):
+            return name
+    return "неизвестный формат, первые байты " + head.hex(" ")
+
+
+# В контейнере PATH бывает урезан до nix-профиля, поэтому ищем и по обычным местам.
+_TOOL_DIRS = ("/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin", "/usr/sbin")
+
+
+def tool_path(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in _TOOL_DIRS:
+        p = Path(d) / name
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
+def available_tools() -> list[str]:
+    return [t for t in ("bsdtar", "unar", "unrar", "7z", "7zz", "tar") if tool_path(t)]
+
+
 def _extract_with_tool(archive: Path, dest: Path) -> None:
     """RAR / 7z / tar — сторонними распаковщиками.
 
@@ -219,7 +259,7 @@ def _extract_with_tool(archive: Path, dest: Path) -> None:
     unar / unrar / 7z используются, если установлены.
     """
     attempts = [
-        (tool, args)
+        (tool_path(tool) or tool, args)
         for tool, args in (
             ("unar", ["-quiet", "-force-overwrite", "-output-directory", str(dest), str(archive)]),
             ("7z", ["x", "-y", f"-o{dest}", str(archive)]),
@@ -227,10 +267,13 @@ def _extract_with_tool(archive: Path, dest: Path) -> None:
             ("unrar", ["x", "-y", "-inul", str(archive), str(dest) + "/"]),
             ("bsdtar", ["-x", "-f", str(archive), "-C", str(dest)]),
         )
-        if shutil.which(tool)
+        if tool_path(tool)
     ]
     if not attempts:
-        raise ArchiveError("на этой машине нет ни одного распаковщика архивов")
+        raise ArchiveError(
+            f"формат «{sniff(archive)}», а распаковщиков на машине нет "
+            "(нужен bsdtar / unar / 7z)"
+        )
 
     errors = []
     for tool, args in attempts:
@@ -245,7 +288,20 @@ def _extract_with_tool(archive: Path, dest: Path) -> None:
 def collect_from_archive(archive_path: Path, dest_dir: Path) -> list[tuple[str, Path]]:
     """Достать PDF-этикетки из архива: zip — своими силами, rar/7z/tar — распаковщиком."""
     dest_dir.mkdir(parents=True, exist_ok=True)
-    if zipfile.is_zipfile(archive_path):
+    size = archive_path.stat().st_size if archive_path.exists() else 0
+
+    # zip разбираем сами, без внешних программ. is_zipfile бывает капризен
+    # (например, у архива лишние байты в хвосте), поэтому пробуем и напрямую.
+    try:
         return collect_from_zip(archive_path, dest_dir)
-    _extract_with_tool(archive_path, dest_dir)
+    except (zipfile.BadZipFile, OSError) as zip_err:
+        zip_reason = str(zip_err) or type(zip_err).__name__
+
+    try:
+        _extract_with_tool(archive_path, dest_dir)
+    except ArchiveError as e:
+        raise ArchiveError(
+            f"{e}. Файл: {size / 1e6:.1f} МБ, похоже на «{sniff(archive_path)}»; "
+            f"как zip не читается ({zip_reason})"
+        )
     return _collect_pdfs(dest_dir)
