@@ -29,7 +29,7 @@ from telegram.ext import (
 
 import pool_store
 from folders import get_roots, resolve_folder
-from matcher import parse_any_file
+from order_file import make_template, parse_order_file
 from message_parser import parse_message
 from pdf_builder import BuildReport, FolderSource, build_from_source, make_output_name
 from pool import (ARCHIVE_SUFFIXES, ArchiveError, Pool, available_tools,
@@ -47,8 +47,9 @@ HELP = (
     "Как пользоваться:\n\n"
     "1. Перетащите боту свои PDF-этикетки ЧЗ — хоть 60 штук сразу, "
     "или архивом — .zip, .rar, .7z.\n"
-    "2. Пришлите список артикулов (можно с маркерами `ozon` / `yandex`, "
-    "если списка два). Список можно написать прямо в подписи к архиву — "
+    "2. Пришлите список артикулов — текстом (можно с маркерами `ozon` / `yandex`, "
+    "если списка два) или файлом Excel/CSV, который заполняет склад. "
+    "Текстовый список можно написать прямо в подписи к архиву — "
     "тогда всё делается одним сообщением.\n"
     "3. Получаете единый PDF для печати: страницы в порядке списка, "
     "повтор в списке = ещё одна страница.\n\n"
@@ -60,6 +61,7 @@ HELP = (
     "Команды:\n"
     "/pools — сохранённые пулы, /pool <имя> — переключиться\n"
     "/go — собрать пул из уже присланных файлов, не дожидаясь\n"
+    "/template — шаблон Excel для списка заказа\n"
     "/reset — забыть загруженное\n"
     "/whoami — ваш Telegram ID"
 )
@@ -416,6 +418,23 @@ async def cmd_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await build_and_send(update, pending, pool, pool.name, [])
 
 
+async def cmd_template(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await deny(update)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        path = await asyncio.to_thread(make_template, Path(td) / "Шаблон заказа ЧЗ.xlsx")
+        with open(path, "rb") as fh:
+            await update.message.reply_document(
+                document=fh,
+                filename=path.name,
+                caption="Заполните артикулы по одному в строке — порядок строк станет "
+                        "порядком страниц в PDF. Количество и маркетплейс необязательны: "
+                        "повтор можно задать и просто второй строкой.\n"
+                        "Свой файл тоже подойдёт — колонку с артикулами бот найдёт сам.",
+            )
+
+
 async def cmd_diag(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Состояние машины, на которой крутится бот."""
     if not is_allowed(update):
@@ -570,31 +589,47 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         schedule_finalize(update, ctx)
         return
 
-    if suffix in (".csv", ".xlsx"):
+    if suffix in (".csv", ".xlsx", ".xlsm"):
         with tempfile.TemporaryDirectory() as td:
             local = Path(td) / name
             if not await download_doc(update, doc, local):
                 return
-            parsed_file = await asyncio.to_thread(parse_any_file, local)
-        if parsed_file.warnings:
-            await update.message.reply_text("\n".join(parsed_file.warnings))
-        if not parsed_file.codes:
-            await update.message.reply_text("В файле не нашлось артикулов.")
+            order = await asyncio.to_thread(parse_order_file, local)
+        if order.warnings:
+            await update.message.reply_text("\n".join(order.warnings))
+        if not order.total:
             return
+
+        # Маркетплейс: из колонки/маркера в файле, иначе из подписи, иначе нейтрально
         low = caption.lower()
-        marketplace = "YANDEX" if suffix == ".xlsx" else "OZON"
+        caption_market = ""
         if any(m in low for m in ("yandex", "яндекс", "ym")):
-            marketplace = "YANDEX"
+            caption_market = "YANDEX"
         elif any(m in low for m in ("ozon", "озон", "ozn")):
-            marketplace = "OZON"
-        jobs = [Job(marketplace, parsed_file.codes)]
+            caption_market = "OZON"
+
+        jobs: list[Job] = []
+        for market, codes in order.lists.items():
+            label = market or caption_market or "ZAKAZ"
+            for job in jobs:
+                if job.marketplace == label:
+                    job.codes.extend(codes)
+                    break
+            else:
+                jobs.append(Job(label, codes))
+
+        await update.message.reply_text(
+            f"Из файла «{name}»: {order.note}.\n"
+            + ", ".join(f"{j.marketplace.lower()} — {len(j.codes)} поз." for j in jobs)
+            + "\nПорядок строк сохранён, повторы учтены."
+        )
+
         parsed_cap = parse_message(caption)
         source, source_name, notes = await active_source(update, ctx, parsed_cap.folder_query)
         if source is None:
             ctx.chat_data["pending_jobs"] = jobs
             await update.message.reply_text(
-                f"{marketplace}: принял {len(parsed_file.codes)} позиций из файла.\n"
-                "Теперь пришлите PDF-этикетки или .zip."
+                "Теперь пришлите этикетки — файлами или архивом."
             )
             return
         await build_and_send(update, jobs, source, source_name, notes)
@@ -602,7 +637,7 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "Понимаю: .pdf (этикетки или готовый пул), архив с этикетками "
-        "(.zip, .rar, .7z, .tar), .csv / .xlsx выгрузки заказов."
+        "(.zip, .rar, .7z, .tar), .xlsx / .csv со списком заказа (/template)."
     )
 
 
@@ -674,6 +709,7 @@ def main() -> None:
     app.add_handler(CommandHandler("go", cmd_go))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("diag", cmd_diag))
+    app.add_handler(CommandHandler("template", cmd_template))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)

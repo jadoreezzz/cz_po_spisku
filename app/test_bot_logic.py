@@ -334,6 +334,91 @@ def test_summary_format():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_order_file_formats():
+    """Файл заказа: шаблон склада, шапки, количество, маркеры, csv."""
+    import csv as _csv
+
+    import openpyxl
+
+    from order_file import make_template, parse_order_file
+
+    tmp = Path(tempfile.mkdtemp(prefix="cz_order_"))
+
+    # 1. Шаблон склада: без шапки, артикул в колонке A, название в B, хвост пустых строк
+    p1 = tmp / "sklad.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append([None, "\xa0\xa0"])
+    for code, name in (
+        ("VDLZK004F-S", "Водолазка лапша"),
+        ("FL-SHRT001H-XL", "Майка лапша"),
+        ("FL-SHRT001H-XL", "Майка лапша"),
+        ("G-LONG004F-XL", "Лонгслив"),
+    ):
+        ws.append([code, name])
+    for _ in range(60):
+        ws.append([None, None])
+    wb.save(p1)
+    r = parse_order_file(p1)
+    assert r.lists == {"": ["VDLZK004F-S", "FL-SHRT001H-XL", "FL-SHRT001H-XL", "G-LONG004F-XL"]}, r.lists
+    print("OK: шаблон склада — порядок и повторы сохранены, названия и пустые строки не мешают")
+
+    # 2. Шапка + количество: 2 шт = две страницы
+    p2 = tmp / "qty.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Артикул", "Кол-во"])
+    ws.append(["A-CODE001F-M", 2])
+    ws.append(["B-CODE002F-L", None])
+    wb.save(p2)
+    r = parse_order_file(p2)
+    assert r.lists == {"": ["A-CODE001F-M", "A-CODE001F-M", "B-CODE002F-L"]}, r.lists
+    assert "Кол-во" in r.note, r.note
+    print("OK: колонка количества разворачивается в повторы")
+
+    # 3. Маркеры ozon/yandex строкой внутри файла (как в текстовых сообщениях — маркер после списка)
+    p3 = tmp / "markers.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["A-CODE001F-M", "назв"])
+    ws.append(["ozon"])
+    ws.append(["B-CODE002F-L", "назв"])
+    ws.append(["yandex"])
+    wb.save(p3)
+    r = parse_order_file(p3)
+    assert r.lists == {"OZON": ["A-CODE001F-M"], "YANDEX": ["B-CODE002F-L"]}, r.lists
+    print("OK: строки-маркеры делят файл на списки Ozon/Yandex")
+
+    # 4. CSV выгрузка Ozon
+    p4 = tmp / "ozon.csv"
+    with open(p4, "w", newline="", encoding="utf-8-sig") as f:
+        w = _csv.writer(f, delimiter=";")
+        w.writerow(["Номер отправления", "Артикул", "Статус"])
+        w.writerow(["1", "A-CODE001F-M", "x"])
+        w.writerow(["2", "A-CODE001F-M", "x"])
+    r = parse_order_file(p4)
+    assert r.lists == {"": ["A-CODE001F-M", "A-CODE001F-M"]}, r.lists
+    print("OK: csv-выгрузка Ozon")
+
+    # 5. Наш шаблон читается сам собой
+    r = parse_order_file(make_template(tmp / "tpl.xlsx"))
+    assert r.lists == {"OZON": ["RUSH114B-XXL", "SHORT001F-M", "SHORT001F-M"],
+                       "YANDEX": ["V-SHORT001M-L"]}, r.lists
+    print("OK: /template читается собственным разбором")
+
+    # 6. Файл без артикулов — понятное предупреждение, без падения
+    p6 = tmp / "junk.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["дата", "сумма"])
+    ws.append(["01.09", 100])
+    wb.save(p6)
+    r = parse_order_file(p6)
+    assert not r.total and r.warnings, r
+    print("OK: файл без артикулов — предупреждение, не падение")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def run():
     test_parse_real_message()
     test_parse_marker_before_and_reverse_order()
@@ -346,6 +431,7 @@ def run():
     test_archive_via_external_tool()
     test_caption_as_list_and_zip_hygiene()
     test_summary_format()
+    test_order_file_formats()
     print("\nВСЕ ТЕСТЫ БОТА ПРОЙДЕНЫ")
 
 
