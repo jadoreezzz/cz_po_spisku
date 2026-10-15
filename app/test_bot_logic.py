@@ -563,9 +563,11 @@ def test_lamoda_flags_and_real_files():
     assert not bad and pool.pvz_count == 41 and pool.item_count == 66 and len(pool.orders) == 41, pool
     loaded = load_lamoda_pool(tmp / "p.pdf")
     assert loaded is not None and len(loaded.pages) == pool.page_count
-    rep = build_lamoda([], loaded, tmp / "all.pdf")
-    assert len(PdfReader(str(tmp / "all.pdf")).pages) == 107 and rep.orders == 41
-    print("OK: реальные файлы Lamoda — 41 заказ, 107 страниц, индекс переживает запись")
+    rep = build_lamoda([], loaded, tmp / "all")
+    assert rep.orders == 41 and rep.pvz_pages == 41 and rep.item_pages == 66, rep
+    assert len(PdfReader(rep.pvz_path).pages) == 41
+    assert len(PdfReader(rep.items_path).pages) == 66
+    print("OK: реальные файлы Lamoda — 41 транспортная + 66 товарных двумя пачками")
     shutil.rmtree(tmp, ignore_errors=True)
 
 
