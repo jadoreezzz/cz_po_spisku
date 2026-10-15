@@ -8,6 +8,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+from lamoda_pool import LamodaPool, build_lamoda_pool, load_lamoda_pool
 from pool import Pool, build_pool, load_pool
 
 # На сервере (Railway) путь задаётся переменной CZ_POOL_ROOT и должен указывать
@@ -61,14 +62,19 @@ def set_active(chat_id: int, pool_path: Path) -> None:
     _save_state(data)
 
 
-def get_active(chat_id: int) -> Pool | None:
+def load_any(path: Path) -> Pool | LamodaPool | None:
+    """Пул ЧЗ или пул Lamoda — отличаются индексом внутри файла."""
+    return load_pool(path) or load_lamoda_pool(path)
+
+
+def get_active(chat_id: int) -> Pool | LamodaPool | None:
     path = _state().get(str(chat_id))
     if not path:
         return None
     p = Path(path)
     if not p.exists():
         return None
-    return load_pool(p)
+    return load_any(p)
 
 
 def list_pools(chat_id: int) -> list[Path]:
@@ -100,6 +106,14 @@ def save_pool(chat_id: int, sources: list[tuple[str, Path]], name: str) -> tuple
     return pool, unreadable
 
 
+def save_lamoda_pool(chat_id: int, sources: list[tuple[str, Path]],
+                     name: str) -> tuple[LamodaPool, list[str]]:
+    target = chat_dir(chat_id) / f"{_slug(name)}.pdf"
+    pool, unreadable = build_lamoda_pool(sources, target, _slug(name))
+    set_active(chat_id, pool.path)
+    return pool, unreadable
+
+
 def inbox_files(chat_id: int) -> list[tuple[str, Path]]:
     d = inbox_dir(chat_id)
     files = sorted(f for f in d.iterdir() if f.is_file() and f.suffix.lower() == ".pdf")
@@ -111,14 +125,14 @@ def clear_inbox(chat_id: int) -> None:
     inbox_dir(chat_id)
 
 
-def adopt_pool_file(chat_id: int, src: Path, name: str) -> Pool | None:
+def adopt_pool_file(chat_id: int, src: Path, name: str) -> Pool | LamodaPool | None:
     """Пользователь прислал ранее собранный пул — кладём его в хранилище и делаем активным."""
-    pool = load_pool(src, name=_slug(name))
+    pool = load_any(src)
     if pool is None:
         return None
     target = chat_dir(chat_id) / f"{_slug(name)}.pdf"
     shutil.copyfile(src, target)
-    saved = load_pool(target, name=_slug(name))
+    saved = load_any(target)
     if saved is None:
         return None
     set_active(chat_id, target)

@@ -419,6 +419,116 @@ def test_order_file_formats():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _blank_pool(kinds):
+    """Синтетический пул Lamoda: страницы пустые, но каждая своей ширины —
+    так в итоговом PDF видно, какие страницы и в каком порядке в него попали."""
+    from lamoda_pool import LamodaPage, LamodaPool
+
+    tmp = Path(tempfile.mkdtemp(prefix="cz_lam_"))
+    w = PdfWriter()
+    for i in range(len(kinds)):
+        w.add_blank_page(width=100 + i, height=200)
+    path = tmp / "pool.pdf"
+    with open(path, "wb") as f:
+        w.write(f)
+    pages = [LamodaPage(*k) for k in kinds]
+    return LamodaPool(name="ламода 14", path=path, pages=pages), tmp
+
+
+def _widths(path: Path) -> list[int]:
+    return [int(float(pg.mediabox.width)) - 100 for pg in PdfReader(str(path)).pages]
+
+
+def test_lamoda_page_parsing():
+    from lamoda_pool import KIND_ITEM, KIND_PVZ, describe_page
+
+    pvz = describe_page(
+        "ПВЗ\nFBS6D3D63547\nИП Сафаров Физули Акифович FBS\nRU261013-782856\n"
+        "Верхне-Печерская 7б,\n603000, Нижний Новгород"
+    )
+    assert pvz.kind == KIND_PVZ and pvz.order_base == "RU261013-782856" and pvz.article is None, pvz
+
+    # номер позиции в товарной этикетке разорван переносом строки
+    item = describe_page(
+        "Бренд\nFizuli\nТовар\nФутболка Fizuli\nРазмер\n3XL\nАртикул\n"
+        "T-SHIRT001F-3XL\nRU261013-782856-\n001\nFBS"
+    )
+    assert item.kind == KIND_ITEM, item
+    assert item.article == "T-SHIRT001F-3XL", item
+    assert item.order_item == "RU261013-782856-001", item
+    assert item.order_base == "RU261013-782856", item
+
+    assert describe_page("просто какой-то текст без номера") is None
+    print("OK: разбор страниц Lamoda (ПВЗ, товарная, перенос в номере позиции)")
+
+
+def test_lamoda_build_orders():
+    from lamoda_pool import KIND_ITEM, KIND_PVZ, build_lamoda
+
+    # заказ A: 2 позиции, заказ B: 1; артикул AAA есть в обоих заказах
+    pool, tmp = _blank_pool([
+        (KIND_PVZ, "RU261013-782856", None, None),          # 0
+        (KIND_PVZ, "RU261013-232461", None, None),          # 1
+        (KIND_ITEM, "RU261013-782856", "RU261013-782856-001", "AAA-M"),  # 2
+        (KIND_ITEM, "RU261013-782856", "RU261013-782856-002", "BBB-L"),  # 3
+        (KIND_ITEM, "RU261013-232461", "RU261013-232461-001", "AAA-M"),  # 4
+    ])
+
+    # 1. весь файл: заказ за заказом, транспортная перед своими товарными
+    r = build_lamoda([], pool, tmp / "all.pdf")
+    assert _widths(tmp / "all.pdf") == [0, 2, 3, 1, 4], _widths(tmp / "all.pdf")
+    assert r.orders == 2 and r.mode.startswith("по заказам")
+    print("OK: Lamoda целиком — транспортная заказа идёт перед его товарными")
+
+    # 2. по артикулам: повтор берёт этикетку из другого заказа, транспортная добавляется один раз
+    r2 = build_lamoda(["AAA-M", "AAA-M", "НЕТ-M"], pool, tmp / "art.pdf")
+    assert _widths(tmp / "art.pdf") == [0, 2, 1, 4], _widths(tmp / "art.pdf")
+    assert r2.found == 2 and r2.missing == ["НЕТ-M"], r2
+    print("OK: Lamoda по артикулам — повтор берётся из следующего заказа, пропажа отмечена")
+
+    # 3. по номерам заказов
+    r3 = build_lamoda(["RU261013-232461"], pool, tmp / "ord.pdf")
+    assert _widths(tmp / "ord.pdf") == [1, 4], _widths(tmp / "ord.pdf")
+    assert r3.mode == "по номерам заказов"
+    print("OK: Lamoda по номерам заказов")
+
+    # 4. без транспортных / только транспортные
+    build_lamoda(["AAA-M", "BBB-L"], pool, tmp / "noPvz.pdf", include_pvz=False)
+    assert _widths(tmp / "noPvz.pdf") == [2, 3]
+    build_lamoda([], pool, tmp / "onlyPvz.pdf", include_items=False)
+    assert _widths(tmp / "onlyPvz.pdf") == [0, 1]
+    print("OK: Lamoda — режимы «без транспортных» и «только транспортные»")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lamoda_flags_and_real_files():
+    from tg_bot import lamoda_flags
+
+    assert lamoda_flags("собери по заказам") == (True, True, True)
+    assert lamoda_flags("без транспортных") == (False, True, False)
+    assert lamoda_flags("только транспортные, целиком") == (True, False, True)
+    print("OK: разбор режимов Lamoda из текста сообщения")
+
+    big = Path.home() / "Desktop" / "ламода_большие_14.pdf"
+    small = Path.home() / "Desktop" / "ламода_маленькие_14.pdf"
+    if not (big.exists() and small.exists()):
+        print("SKIP: реальных файлов Lamoda нет на этой машине")
+        return
+
+    from lamoda_pool import build_lamoda, build_lamoda_pool, load_lamoda_pool, looks_like_lamoda
+
+    tmp = Path(tempfile.mkdtemp(prefix="cz_lamreal_"))
+    assert looks_like_lamoda(big) and looks_like_lamoda(small)
+    pool, bad = build_lamoda_pool([(big.name, big), (small.name, small)], tmp / "p.pdf", "ламода 14")
+    assert not bad and pool.pvz_count == 41 and pool.item_count == 66 and len(pool.orders) == 41, pool
+    loaded = load_lamoda_pool(tmp / "p.pdf")
+    assert loaded is not None and len(loaded.pages) == pool.page_count
+    rep = build_lamoda([], loaded, tmp / "all.pdf")
+    assert len(PdfReader(str(tmp / "all.pdf")).pages) == 107 and rep.orders == 41
+    print("OK: реальные файлы Lamoda — 41 заказ, 107 страниц, индекс переживает запись")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def run():
     test_parse_real_message()
     test_parse_marker_before_and_reverse_order()
@@ -432,6 +542,9 @@ def run():
     test_caption_as_list_and_zip_hygiene()
     test_summary_format()
     test_order_file_formats()
+    test_lamoda_page_parsing()
+    test_lamoda_build_orders()
+    test_lamoda_flags_and_real_files()
     print("\nВСЕ ТЕСТЫ БОТА ПРОЙДЕНЫ")
 
 

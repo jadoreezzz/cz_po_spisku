@@ -29,7 +29,9 @@ from telegram.ext import (
 
 import pool_store
 from folders import get_roots, resolve_folder
+from lamoda_pool import LamodaPool, build_lamoda, looks_like_lamoda
 from order_file import make_template, parse_order_file
+from pdf_io import read_pdf_with_retry
 from message_parser import parse_message
 from pdf_builder import BuildReport, FolderSource, build_from_source, make_output_name
 from pool import (ARCHIVE_SUFFIXES, ArchiveError, Pool, available_tools,
@@ -55,6 +57,10 @@ HELP = (
     "повтор в списке = ещё одна страница.\n\n"
     "Пример списка:\n"
     "RUSH114B-XXL\nRUSH083B-XXL\n\nozon\n\nRUSH079B-L\nV-SHORT001M-L\n\nyandex\n\n"
+    "Lamoda: пришлите оба файла — «большие» (транспортные) и «маленькие» (товарные). "
+    "Бот сам их опознает. Дальше либо список артикулов, либо «собери по заказам» — "
+    "получите один файл, где перед товарными этикетками заказа идёт его транспортная. "
+    "Можно добавить «без транспортных» или «только транспортные».\n\n"
     "Загруженные этикетки бот склеивает в один «пул» и присылает его вам — "
     "этот файл можно сохранить и в следующий раз прислать вместо всех этикеток: "
     "индекс артикулов зашит внутрь него.\n\n"
@@ -100,6 +106,15 @@ async def deny(update: Update) -> None:
 class Job:
     marketplace: str
     codes: list[str]
+
+
+def lamoda_flags(text: str) -> tuple[bool, bool, bool]:
+    """(печатать транспортные, печатать товарные, собрать весь файл целиком)."""
+    low = (text or "").lower()
+    include_pvz = not any(w in low for w in ("без транспорт", "только товарн", "только маленьк"))
+    include_items = not any(w in low for w in ("без товарн", "только транспорт", "только больш"))
+    whole = any(w in low for w in ("весь", "целиком", "все заказы", "по заказам", "всё"))
+    return include_pvz, include_items, whole
 
 
 def _counted(codes: list[str]) -> list[tuple[str, int]]:
@@ -158,6 +173,14 @@ def format_summary(results: list[tuple["Job", BuildReport]], source_name: str) -
     return "\n".join(lines)
 
 
+def _run_lamoda(codes: list[str], pool: LamodaPool, source_name: str, out_dir: Path,
+                include_pvz: bool, include_items: bool):
+    safe = "".join(c for c in source_name if c.isalnum() or c in "-_") or "lamoda"
+    target = out_dir / f"LAMODA_{safe}_po_spisku.pdf"
+    return build_lamoda(codes, pool, target, include_pvz=include_pvz,
+                        include_items=include_items)
+
+
 def _run_jobs(jobs: list[Job], source, source_name: str, out_dir: Path):
     results = []
     for job in jobs:
@@ -171,6 +194,11 @@ async def build_and_send(update: Update, jobs: list[Job], source, source_name: s
     msg = update.message
     chat_id = msg.chat_id
     await msg.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+
+    if getattr(source, "kind", "") == "lamoda":
+        await build_and_send_lamoda(update, jobs, source, source_name, notes)
+        return
+
     try:
         results = await asyncio.to_thread(
             _run_jobs, jobs, source, source_name, pool_store.out_dir(chat_id)
@@ -215,6 +243,55 @@ def pool_name_from(caption: str, fallback: str) -> str:
     return first[:40] or fallback
 
 
+async def build_and_send_lamoda(update: Update, jobs: list[Job], pool: LamodaPool,
+                                source_name: str, notes: list[str]) -> None:
+    """У Lamoda один файл на всё: транспортная этикетка заказа + его товарные."""
+    msg = update.message
+    text = msg.text or msg.caption or ""
+    include_pvz, include_items, whole = lamoda_flags(text)
+    codes: list[str] = [] if whole else [c for job in jobs for c in job.codes]
+
+    try:
+        report = await asyncio.to_thread(
+            _run_lamoda, codes, pool, source_name, pool_store.out_dir(msg.chat_id),
+            include_pvz, include_items,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("lamoda build failed")
+        await msg.reply_text(f"Ошибка при сборке: {e}")
+        return
+
+    path = Path(report.output_path)  # type: ignore[arg-type]
+    pages = len(read_pdf_with_retry(path).pages)
+    await msg.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+    with open(path, "rb") as fh:
+        await msg.reply_document(
+            document=fh, filename=path.name,
+            caption=f"НА ПЕЧАТЬ — Lamoda, {pages} стр. ({report.mode}).",
+        )
+
+    lines = list(notes)
+    lines.append(f"lamoda {report.found}/{report.total}, заказов {report.orders}, страниц {pages}.")
+    if report.missing:
+        lines.append(
+            "не найдено в пуле " + source_name + ": "
+            + ", ".join(f"{c} ({_qty(n)}этикетки нет)" for c, n in _counted(report.missing))
+            + "."
+        )
+    if not include_pvz:
+        lines.append("Транспортные этикетки не включены.")
+    if not include_items:
+        lines.append("Товарные этикетки не включены.")
+    await msg.reply_text("\n".join(lines))
+
+
+def pool_summary(pool) -> str:
+    if getattr(pool, "kind", "") == "lamoda":
+        return (f"«{pool.name}» (Lamoda): транспортных {pool.pvz_count}, "
+                f"товарных {pool.item_count}, заказов {len(pool.orders)}")
+    return f"«{pool.name}»: {len(pool.filenames)} файлов, {pool.page_count} страниц"
+
+
 async def send_pool_file(update: Update, pool: Pool) -> None:
     with open(pool.path, "rb") as fh:
         await update.message.reply_document(
@@ -234,6 +311,28 @@ async def finalize_inbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     if not sources:
         return None
     name = name or ctx.chat_data.pop("pool_name", None) or datetime.now().strftime("пул %d.%m %H:%M")
+
+    lam_flags = await asyncio.to_thread(lambda: [looks_like_lamoda(p) for _, p in sources])
+    lam = [s for s, is_lam in zip(sources, lam_flags) if is_lam]
+    cz = [s for s, is_lam in zip(sources, lam_flags) if not is_lam]
+
+    if lam:
+        pool, unreadable = await asyncio.to_thread(
+            pool_store.save_lamoda_pool, chat_id, lam, name
+        )
+        pool_store.clear_inbox(chat_id)
+        ctx.chat_data["pool_name"] = None
+        if announce:
+            text = (f"Пул Lamoda «{pool.name}»: транспортных {pool.pvz_count}, "
+                    f"товарных {pool.item_count}, заказов {len(pool.orders)}.")
+            if cz:
+                text += (f"\nЕщё {len(cz)} файлов не похожи на этикетки Lamoda — "
+                         "пришлите их отдельным сообщением, если это этикетки ЧЗ.")
+            if unreadable:
+                text += "\nНе удалось прочитать: " + ", ".join(unreadable)
+            await update.message.reply_text(text)
+        return pool
+
     pool, unreadable = await asyncio.to_thread(pool_store.save_pool, chat_id, sources, name)
     pool_store.clear_inbox(chat_id)
     ctx.chat_data["pool_name"] = None
@@ -382,7 +481,7 @@ async def cmd_pool(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not arg:
         pool = pool_store.get_active(chat_id)
         await update.message.reply_text(
-            f"Активный пул: «{pool.name}» — {len(pool.filenames)} файлов, {pool.page_count} страниц."
+            "Активный пул: " + pool_summary(pool) + "."
             if pool else "Активного пула нет. Пришлите PDF-этикетки или .zip."
         )
         return
@@ -393,7 +492,7 @@ async def cmd_pool(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     pool_store.set_active(chat_id, path)
     pool = pool_store.get_active(chat_id)
     await update.message.reply_text(
-        f"Активный пул: «{pool.name}» — {len(pool.filenames)} файлов, {pool.page_count} страниц."
+        "Активный пул: " + pool_summary(pool) + "."
         if pool else f"Не удалось прочитать пул «{arg}»."
     )
 
@@ -479,6 +578,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     parsed = parse_message(text)
 
     if parsed.is_empty:
+        active = pool_store.get_active(update.effective_chat.id)
+        if getattr(active, "kind", "") == "lamoda" and lamoda_flags(text)[2]:
+            await build_and_send_lamoda(update, [], active, active.name, [])
+            return
         pending = ctx.chat_data.get("pending_jobs")
         if pending and text.strip():
             ctx.chat_data["pool_name"] = text.strip()
@@ -567,8 +670,7 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             target.unlink(missing_ok=True)
             if adopted:
                 await update.message.reply_text(
-                    f"Принял готовый пул «{adopted.name}»: файлов {len(adopted.filenames)}, "
-                    f"страниц {adopted.page_count}. Присылайте список."
+                    "Принял готовый пул " + pool_summary(adopted) + ". Присылайте список."
                 )
                 parsed_cap = parse_message(caption)
                 jobs = jobs_from(parsed_cap) or ctx.chat_data.pop("pending_jobs", None)
