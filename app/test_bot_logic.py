@@ -465,39 +465,79 @@ def test_lamoda_page_parsing():
 def test_lamoda_build_orders():
     from lamoda_pool import KIND_ITEM, KIND_PVZ, build_lamoda
 
-    # заказ A: 2 позиции, заказ B: 1; артикул AAA есть в обоих заказах
+    # заказ A: 2 позиции, заказ B: 1; артикул AAA-M есть в обоих заказах
     pool, tmp = _blank_pool([
-        (KIND_PVZ, "RU261013-782856", None, None),          # 0
-        (KIND_PVZ, "RU261013-232461", None, None),          # 1
-        (KIND_ITEM, "RU261013-782856", "RU261013-782856-001", "AAA-M"),  # 2
-        (KIND_ITEM, "RU261013-782856", "RU261013-782856-002", "BBB-L"),  # 3
-        (KIND_ITEM, "RU261013-232461", "RU261013-232461-001", "AAA-M"),  # 4
+        (KIND_PVZ, "RU261013-782856", None, None),                             # 0
+        (KIND_PVZ, "RU261013-232461", None, None),                             # 1
+        (KIND_ITEM, "RU261013-782856", "RU261013-782856-001", "AAA-M"),        # 2
+        (KIND_ITEM, "RU261013-782856", "RU261013-782856-002", "BBB-L"),        # 3
+        (KIND_ITEM, "RU261013-232461", "RU261013-232461-001", "AAA-M"),        # 4
     ])
 
-    # 1. весь файл: заказ за заказом, транспортная перед своими товарными
-    r = build_lamoda([], pool, tmp / "all.pdf")
-    assert _widths(tmp / "all.pdf") == [0, 2, 3, 1, 4], _widths(tmp / "all.pdf")
-    assert r.orders == 2 and r.mode.startswith("по заказам")
-    print("OK: Lamoda целиком — транспортная заказа идёт перед его товарными")
+    # 1. весь пул: две отдельные пачки, у каждой свой порядок
+    r = build_lamoda([], pool, tmp / "all")
+    assert _widths(Path(r.pvz_path)) == [0, 1], _widths(Path(r.pvz_path))
+    assert _widths(Path(r.items_path)) == [2, 3, 4], _widths(Path(r.items_path))
+    assert r.orders == 2 and "весь пул" in r.mode
+    print("OK: Lamoda — транспортные и товарные отдаются двумя отдельными файлами")
 
-    # 2. по артикулам: повтор берёт этикетку из другого заказа, транспортная добавляется один раз
-    r2 = build_lamoda(["AAA-M", "AAA-M", "НЕТ-M"], pool, tmp / "art.pdf")
-    assert _widths(tmp / "art.pdf") == [0, 2, 1, 4], _widths(tmp / "art.pdf")
-    assert r2.found == 2 and r2.missing == ["НЕТ-M"], r2
-    print("OK: Lamoda по артикулам — повтор берётся из следующего заказа, пропажа отмечена")
+    # 2. по номерам позиций (так приходит выгрузка Lamoda) — точное попадание
+    r2 = build_lamoda(["RU261013-232461-001", "RU261013-782856-002"], pool, tmp / "byitem")
+    assert r2.mode == "по номерам позиций", r2.mode
+    assert _widths(Path(r2.items_path)) == [4, 3], _widths(Path(r2.items_path))
+    assert _widths(Path(r2.pvz_path)) == [1, 0], _widths(Path(r2.pvz_path))
+    assert r2.found == 2 and not r2.missing
+    print("OK: Lamoda по номерам позиций — порядок списка сохранён в обеих пачках")
 
-    # 3. по номерам заказов
-    r3 = build_lamoda(["RU261013-232461"], pool, tmp / "ord.pdf")
-    assert _widths(tmp / "ord.pdf") == [1, 4], _widths(tmp / "ord.pdf")
-    assert r3.mode == "по номерам заказов"
+    # 3. по артикулам: повтор берётся из следующего заказа, пропажа отмечена
+    r3 = build_lamoda(["AAA-M", "AAA-M", "НЕТ-M"], pool, tmp / "art")
+    assert _widths(Path(r3.items_path)) == [2, 4], _widths(Path(r3.items_path))
+    assert r3.found == 2 and r3.missing == ["НЕТ-M"], r3
+    print("OK: Lamoda по артикулам — повтор берётся из другого заказа")
+
+    # 4. по номерам заказов
+    r4 = build_lamoda(["RU261013-232461"], pool, tmp / "ord")
+    assert r4.mode == "по номерам заказов"
+    assert _widths(Path(r4.items_path)) == [4] and _widths(Path(r4.pvz_path)) == [1]
     print("OK: Lamoda по номерам заказов")
 
-    # 4. без транспортных / только транспортные
-    build_lamoda(["AAA-M", "BBB-L"], pool, tmp / "noPvz.pdf", include_pvz=False)
-    assert _widths(tmp / "noPvz.pdf") == [2, 3]
-    build_lamoda([], pool, tmp / "onlyPvz.pdf", include_items=False)
-    assert _widths(tmp / "onlyPvz.pdf") == [0, 1]
-    print("OK: Lamoda — режимы «без транспортных» и «только транспортные»")
+    # 5. режимы «без транспортных» / «только транспортные» — лишний файл не создаётся
+    r5 = build_lamoda(["AAA-M", "BBB-L"], pool, tmp / "noPvz", include_pvz=False)
+    assert r5.pvz_path is None and _widths(Path(r5.items_path)) == [2, 3]
+    r6 = build_lamoda([], pool, tmp / "onlyPvz", include_items=False)
+    assert r6.items_path is None and _widths(Path(r6.pvz_path)) == [0, 1]
+    print("OK: Lamoda — «без транспортных» и «только транспортные»")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lamoda_order_csv():
+    """Выгрузка Lamoda «Order Management»: номера позиций и отменённые строки."""
+    import csv as _csv
+
+    from order_file import parse_order_file
+
+    tmp = Path(tempfile.mkdtemp(prefix="cz_lamcsv_"))
+    path = tmp / "Order Management.csv"
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = _csv.writer(f, delimiter=";")
+        w.writerow(["Партнер", "Номер заказа", "Статус", "Номер упаковки",
+                    "Артикул товара", "Артикул товара (LAMODA)", "Номер товара",
+                    "Описание товара", "Статус товара"])
+        w.writerow(["ИП", "RU261013-782856", "Awaiting shipment", "FBS1",
+                    "T-SHIRT001F-3XL", "XD001XM01FHAIN3XL", "RU261013-782856-001",
+                    "Футболка", "Awaiting shipment"])
+        w.writerow(["ИП", "RU261013-232461", "Awaiting shipment", "",
+                    "S2-SHIRT002F-M", "XD001XM01PCYINM", "RU261013-232461-001",
+                    "Футболка", "Canceled"])
+        w.writerow(["ИП", "RU261013-041412", "Awaiting shipment", "FBS2",
+                    "VEST-TAI-F004-XXL", "XD001XM01YDGINXXL", "RU261013-041412-002",
+                    "Майка", "Awaiting shipment"])
+    r = parse_order_file(path)
+    assert r.lists == {"": ["RU261013-782856-001", "RU261013-041412-002"]}, r.lists
+    assert r.skipped_canceled == 1, r.skipped_canceled
+    # «Статус товара» должен выиграть у «Статус», а «Артикул товара» — у «(LAMODA)»
+    assert "Номер товара" in r.note and "Статус товара" in r.note, r.note
+    print("OK: выгрузка Lamoda — номера позиций, отменённые пропущены, нужные колонки выбраны")
     shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -544,6 +584,7 @@ def run():
     test_order_file_formats()
     test_lamoda_page_parsing()
     test_lamoda_build_orders()
+    test_lamoda_order_csv()
     test_lamoda_flags_and_real_files()
     print("\nВСЕ ТЕСТЫ БОТА ПРОЙДЕНЫ")
 

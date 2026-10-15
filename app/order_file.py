@@ -17,11 +17,15 @@ import openpyxl
 ARTICLE_RE = re.compile(r"^[A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)+$")
 
 ARTICLE_HEADERS = (
-    "артикул", "артикул товара", "артикул продавца", "ваш sku", "sku",
-    "shop sku", "offer id", "код товара", "article", "модель",
+    "артикул товара", "артикул продавца", "артикул", "ваш sku", "shop sku",
+    "sku", "offer id", "код товара", "article", "модель",
 )
 QTY_HEADERS = ("количество", "кол-во", "колво", "шт", "штук", "qty", "quantity", "count")
 MARKET_HEADERS = ("маркетплейс", "площадка", "marketplace", "канал", "магазин")
+ITEM_HEADERS = ("номер товара", "номер позиции", "order item")       # RU######-#-###
+ORDER_HEADERS = ("номер заказа", "order number")                      # RU######-#
+STATUS_HEADERS = ("статус товара", "статус позиции", "item status", "статус", "status")
+CANCELED = ("canceled", "cancelled", "отменен", "отменён", "отмена", "возврат", "refund")
 
 OZON_WORDS = ("ozon", "озон", "ozn")
 YANDEX_WORDS = ("yandex", "яндекс", "yand", "ym", "я.маркет")
@@ -34,6 +38,7 @@ class OrderParse:
     lists: dict[str, list[str]] = field(default_factory=dict)  # "OZON"/"YANDEX"/"" -> коды
     note: str = ""                                             # что распозналось
     warnings: list[str] = field(default_factory=list)
+    skipped_canceled: int = 0                                  # отменённые позиции пропущены
 
     @property
     def total(self) -> int:
@@ -83,21 +88,50 @@ def _market_of(v) -> str:
     return ""
 
 
+_COLUMNS = (
+    ("article", ARTICLE_HEADERS),
+    ("qty", QTY_HEADERS),
+    ("market", MARKET_HEADERS),
+    ("item", ITEM_HEADERS),
+    ("order", ORDER_HEADERS),
+    ("status", STATUS_HEADERS),
+)
+
+
 def _find_header(rows: list[list], limit: int = 15) -> tuple[int, dict[str, int]] | None:
-    """Строка заголовков и индексы нужных колонок."""
+    """Строка заголовков и индексы нужных колонок.
+
+    Точное совпадение имеет приоритет над совпадением по началу, иначе
+    «Артикул товара (LAMODA)» может перебить «Артикул товара».
+    """
     for i, row in enumerate(rows[:limit]):
+        bases = [_header_base(c) for c in row]
         cols: dict[str, int] = {}
-        for j, cell in enumerate(row):
-            name = _norm(cell)
-            if not name:
+        taken: set[int] = set()
+        # Сначала точные совпадения, перебирая кандидатов от более специфичных
+        # к общим: «Статус товара» должен выиграть у «Статус».
+        for key, candidates in _COLUMNS:
+            for cand in candidates:
+                target = _header_base(cand)
+                for j, base in enumerate(bases):
+                    if base == target and j not in taken:
+                        cols[key] = j
+                        taken.add(j)
+                        break
+                if key in cols:
+                    break
+        # Затем — по началу заголовка, для того, что ещё не нашлось
+        for key, candidates in _COLUMNS:
+            if key in cols:
                 continue
-            if "article" not in cols and _is_header(cell, ARTICLE_HEADERS):
-                cols["article"] = j
-            elif "qty" not in cols and _is_header(cell, QTY_HEADERS):
-                cols["qty"] = j
-            elif "market" not in cols and _is_header(cell, MARKET_HEADERS):
-                cols["market"] = j
-        if "article" in cols:
+            for j, cell in enumerate(row):
+                if j in taken or not _norm(cell):
+                    continue
+                if _is_header(cell, candidates):
+                    cols[key] = j
+                    taken.add(j)
+                    break
+        if "article" in cols or "item" in cols:
             return i, cols
     return None
 
@@ -148,20 +182,28 @@ def _marker_row(row: list) -> str | None:
 
 def _parse_rows(rows: list[list]) -> tuple[dict[str, list[str]], str] | None:
     header = _find_header(rows)
+    skipped = 0
     if header is not None:
         start, cols = header
-        a, q, m = cols["article"], cols.get("qty"), cols.get("market")
-        detected = f"колонка артикулов «{str(rows[start][a]).strip()}»"
+        q, m = cols.get("qty"), cols.get("market")
+        it, st = cols.get("item"), cols.get("status")
+        # Номер позиции (RU######-#-###) точнее артикула: он уникален в пределах заказа
+        a = cols["item"] if it is not None else cols["article"]
+        detected = ("колонка позиций «" + str(rows[start][it]).strip() + "»"
+                    if it is not None
+                    else "колонка артикулов «" + str(rows[start][cols["article"]]).strip() + "»")
         if q is not None:
             detected += f", количество «{str(rows[start][q]).strip()}»"
         if m is not None:
             detected += f", маркетплейс «{str(rows[start][m]).strip()}»"
+        if st is not None:
+            detected += f", статус «{str(rows[start][st]).strip()}»"
         data = rows[start + 1:]
     else:
         a = _guess_article_column(rows)
         if a is None:
             return None
-        q = m = None
+        q = m = st = None
         detected = f"колонка {a + 1} (заголовков не нашёл, определил по содержимому)"
         data = rows
 
@@ -190,6 +232,10 @@ def _parse_rows(rows: list[list]) -> tuple[dict[str, list[str]], str] | None:
             continue  # повторная шапка посреди файла
         if not _looks_like_code(code) and header is None:
             continue  # без шапки доверяем только тому, что похоже на артикул
+        if st is not None and st < len(row):
+            if any(w in _norm(row[st]) for w in CANCELED):
+                skipped += 1
+                continue  # отменённую позицию печатать не надо
         qty = _qty_of(row[q]) if q is not None and q < len(row) else 1
 
         if m is not None and m < len(row):
@@ -203,7 +249,9 @@ def _parse_rows(rows: list[list]) -> tuple[dict[str, list[str]], str] | None:
         lists.setdefault("", []).extend(pending)
 
     lists = {k: v for k, v in lists.items() if v}
-    return (lists, detected) if lists else None
+    if skipped:
+        detected += f"; отменённых пропущено: {skipped}"
+    return (lists, detected, skipped) if lists else None
 
 
 def parse_order_file(path: str | Path) -> OrderParse:
@@ -217,15 +265,15 @@ def parse_order_file(path: str | Path) -> OrderParse:
         result.warnings.append(f"Не смог прочитать файл: {e}")
         return result
 
-    best: tuple[dict[str, list[str]], str, str] | None = None
+    best: tuple[dict[str, list[str]], str, str, int] | None = None
     for sheet_name, rows in sheets:
         parsed = _parse_rows(rows)
         if parsed is None:
             continue
-        lists, detected = parsed
+        lists, detected, skipped = parsed
         total = sum(len(v) for v in lists.values())
         if best is None or total > sum(len(v) for v in best[0].values()):
-            best = (lists, detected, sheet_name)
+            best = (lists, detected, sheet_name, skipped)
 
     if best is None:
         names = ", ".join(n for n, _ in sheets) or "—"
@@ -236,10 +284,11 @@ def parse_order_file(path: str | Path) -> OrderParse:
         )
         return result
 
-    lists, detected, sheet_name = best
+    lists, detected, sheet_name, skipped = best
     result.lists = lists
     sheet_note = f"лист «{sheet_name}», " if suffix in (".xlsx", ".xlsm") and len(sheets) > 1 else ""
     result.note = sheet_note + detected
+    result.skipped_canceled = skipped
     return result
 
 

@@ -31,7 +31,6 @@ import pool_store
 from folders import get_roots, resolve_folder
 from lamoda_pool import LamodaPool, build_lamoda, looks_like_lamoda
 from order_file import make_template, parse_order_file
-from pdf_io import read_pdf_with_retry
 from message_parser import parse_message
 from pdf_builder import BuildReport, FolderSource, build_from_source, make_output_name
 from pool import (ARCHIVE_SUFFIXES, ArchiveError, Pool, available_tools,
@@ -261,17 +260,27 @@ async def build_and_send_lamoda(update: Update, jobs: list[Job], pool: LamodaPoo
         await msg.reply_text(f"Ошибка при сборке: {e}")
         return
 
-    path = Path(report.output_path)  # type: ignore[arg-type]
-    pages = len(read_pdf_with_retry(path).pages)
-    await msg.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-    with open(path, "rb") as fh:
-        await msg.reply_document(
-            document=fh, filename=path.name,
-            caption=f"НА ПЕЧАТЬ — Lamoda, {pages} стр. ({report.mode}).",
-        )
+    sent = []
+    for path_str, title, pages in (
+        (report.pvz_path, "транспортные", report.pvz_pages),
+        (report.items_path, "товарные", report.item_pages),
+    ):
+        if not path_str:
+            continue
+        path = Path(path_str)
+        await msg.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        with open(path, "rb") as fh:
+            await msg.reply_document(
+                document=fh, filename=path.name,
+                caption=f"НА ПЕЧАТЬ — Lamoda, {title}: {pages} стр.",
+            )
+        sent.append(f"{title} {pages}")
 
     lines = list(notes)
-    lines.append(f"lamoda {report.found}/{report.total}, заказов {report.orders}, страниц {pages}.")
+    lines.append(
+        f"lamoda {report.found}/{report.total}, заказов {report.orders} "
+        f"({', '.join(sent) if sent else 'пусто'}) — {report.mode}."
+    )
     if report.missing:
         lines.append(
             "не найдено в пуле " + source_name + ": "
@@ -279,9 +288,9 @@ async def build_and_send_lamoda(update: Update, jobs: list[Job], pool: LamodaPoo
             + "."
         )
     if not include_pvz:
-        lines.append("Транспортные этикетки не включены.")
+        lines.append("Транспортные не включены по вашей приписке.")
     if not include_items:
-        lines.append("Товарные этикетки не включены.")
+        lines.append("Товарные не включены по вашей приписке.")
     await msg.reply_text("\n".join(lines))
 
 

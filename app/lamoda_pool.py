@@ -118,6 +118,13 @@ class LamodaPool:
                 return i
         return None
 
+    def find_by_item_number(self, order_item: str) -> int | None:
+        """Точное попадание: номер позиции уникален (RU######-#-###)."""
+        for i, p in enumerate(self.pages):
+            if p.kind == KIND_ITEM and p.order_item == order_item:
+                return i
+        return None
+
 
 # ------------------------------------------------------------------ создание
 
@@ -185,81 +192,96 @@ class LamodaReport:
     found: int = 0
     orders: int = 0
     missing: list[str] = field(default_factory=list)
-    output_path: str | None = None
     mode: str = ""
+    pvz_path: str | None = None      # транспортные («большие») — отдельным файлом
+    items_path: str | None = None    # товарные («маленькие») — отдельным файлом
+    pvz_pages: int = 0
+    item_pages: int = 0
 
 
-def build_lamoda(items: list[str], pool: LamodaPool, output_path: str | Path,
+def build_lamoda(items: list[str], pool: LamodaPool, out_prefix: str | Path,
                  include_pvz: bool = True, include_items: bool = True) -> LamodaReport:
-    """items — артикулы и/или номера заказов (RU######-#) в нужном порядке.
+    """items — номера позиций (RU######-#-###), артикулы или номера заказов, в нужном порядке.
 
-    Пустой список = все заказы в порядке файла. Для каждого заказа сначала
-    идёт транспортная этикетка, затем его товарные — так посылку удобно собирать.
+    Пустой список = весь пул. Результат — ДВА файла: транспортные и товарные.
+    У них разный размер страницы (213x341 и 165x114 pt), печатать их всё равно
+    приходится по отдельности, поэтому в один файл они не мешаются.
     """
     report = LamodaReport(total=len(items))
-    writer = PdfWriter()
+    pvz_writer, item_writer = PdfWriter(), PdfWriter()
     used: set[int] = set()
     pvz_done: set[str] = set()
 
-    def add(i: int) -> None:
-        writer.add_page(pool.page(i))
+    def add_item(i: int) -> None:
         used.add(i)
+        if include_items:
+            item_writer.add_page(pool.page(i))
+            report.item_pages += 1
 
     def add_pvz(order_base: str | None) -> None:
         if not include_pvz or not order_base or order_base in pvz_done:
             return
         pvz_done.add(order_base)
         for i in pool.indexes_of_order(order_base, KIND_PVZ):
-            add(i)
+            pvz_writer.add_page(pool.page(i))
+            report.pvz_pages += 1
             break
 
-    if not items:  # весь файл: заказ за заказом
-        report.mode = "по заказам (весь файл)"
+    if not items:
+        report.mode = "весь пул, заказ за заказом"
         for order in pool.orders:
             add_pvz(order)
-            if include_items:
-                for i in pool.indexes_of_order(order, KIND_ITEM):
-                    add(i)
+            for i in pool.indexes_of_order(order, KIND_ITEM):
+                add_item(i)
         report.total = report.found = len(pool.orders)
-        report.orders = len(pvz_done)
-        output_path = Path(output_path)
-        with open(output_path, "wb") as f:
-            writer.write(f)
-        report.output_path = str(output_path)
-        return report
+    else:
+        stripped = [x.strip() for x in items]
+        if all(ORDER_ITEM_RE.fullmatch(x) for x in stripped):
+            report.mode = "по номерам позиций"
+        elif all(ORDER_BASE_RE.fullmatch(x) for x in stripped):
+            report.mode = "по номерам заказов"
+        else:
+            report.mode = "по артикулам"
 
-    orders_mode = all(ORDER_BASE_RE.fullmatch(x.strip()) for x in items)
-    report.mode = "по номерам заказов" if orders_mode else "по артикулам"
-
-    for raw in items:
-        code = raw.strip()
-        if orders_mode:
-            idxs = pool.indexes_of_order(code, KIND_ITEM)
-            if not idxs and not pool.indexes_of_order(code, KIND_PVZ):
-                report.missing.append(code)
-                continue
-            add_pvz(code)
-            if include_items:
+        for code in stripped:
+            if report.mode == "по номерам позиций":
+                i = pool.find_by_item_number(code)
+                if i is None:
+                    report.missing.append(code)
+                    continue
+                add_pvz(pool.pages[i].order_base)
+                add_item(i)
+                report.found += 1
+            elif report.mode == "по номерам заказов":
+                idxs = pool.indexes_of_order(code, KIND_ITEM)
+                if not idxs and not pool.indexes_of_order(code, KIND_PVZ):
+                    report.missing.append(code)
+                    continue
+                add_pvz(code)
                 for i in idxs:
                     if i not in used:
-                        add(i)
-            report.found += 1
-            continue
-
-        i = pool.find_item(code, used)
-        if i is None:
-            report.missing.append(code)
-            continue
-        add_pvz(pool.pages[i].order_base)
-        if include_items:
-            add(i)
-        else:
-            used.add(i)
-        report.found += 1
+                        add_item(i)
+                report.found += 1
+            else:
+                i = pool.find_item(code, used)
+                if i is None:
+                    report.missing.append(code)
+                    continue
+                add_pvz(pool.pages[i].order_base)
+                add_item(i)
+                report.found += 1
 
     report.orders = len(pvz_done)
-    output_path = Path(output_path)
-    with open(output_path, "wb") as f:
-        writer.write(f)
-    report.output_path = str(output_path)
+    out_prefix = Path(out_prefix)
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+    if include_pvz and report.pvz_pages:
+        path = out_prefix.with_name(out_prefix.name + "_транспортные.pdf")
+        with open(path, "wb") as f:
+            pvz_writer.write(f)
+        report.pvz_path = str(path)
+    if include_items and report.item_pages:
+        path = out_prefix.with_name(out_prefix.name + "_товарные.pdf")
+        with open(path, "wb") as f:
+            item_writer.write(f)
+        report.items_path = str(path)
     return report
